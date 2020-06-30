@@ -32,11 +32,22 @@ from homeassistant.helpers.entity_registry import (
     RegistryEntry,
 )
 from homeassistant.helpers.event import Event
+from homeassistant.loader import bind_hass
 from homeassistant.util import dt as dt_util, ensure_unique_string, slugify
 from homeassistant.util.async_ import run_callback_threadsafe
 
 _LOGGER = logging.getLogger(__name__)
 SLOW_UPDATE_WARNING = 10
+DATA_ENTITY_SOURCE = "entity_info"
+SOURCE_CONFIG_ENTRY = "config_entry"
+SOURCE_PLATFORM_CONFIG = "platform_config"
+
+
+@callback
+@bind_hass
+def entity_sources(hass: HomeAssistant) -> Dict[str, Dict[str, str]]:
+    """Get the entity sources."""
+    return hass.data.get(DATA_ENTITY_SOURCE, {})
 
 
 def generate_entity_id(
@@ -515,8 +526,20 @@ class Entity(ABC):
 
         Not to be extended by integrations.
         """
+        assert self.hass is not None
+
+        if self.platform:
+            info = {"domain": self.platform.platform_name}
+
+            if self.platform.config_entry:
+                info["source"] = SOURCE_CONFIG_ENTRY
+                info["config_entry"] = self.platform.config_entry.entry_id
+            else:
+                info["source"] = SOURCE_PLATFORM_CONFIG
+
+            self.hass.data.setdefault(DATA_ENTITY_SOURCE, {})[self.entity_id] = info
+
         if self.registry_entry is not None:
-            assert self.hass is not None
             self.async_on_remove(
                 self.hass.bus.async_listen(
                     EVENT_ENTITY_REGISTRY_UPDATED, self._async_registry_updated
@@ -528,6 +551,9 @@ class Entity(ABC):
 
         Not to be extended by integrations.
         """
+        if self.platform:
+            assert self.hass is not None
+            self.hass.data[DATA_ENTITY_SOURCE].pop(self.entity_id)
 
     async def _async_registry_updated(self, event: Event) -> None:
         """Handle entity registry update."""
