@@ -3,6 +3,7 @@ from abc import ABC, abstractmethod
 import asyncio
 from contextlib import suppress
 from datetime import datetime
+from functools import partial
 from itertools import islice
 import logging
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, cast
@@ -24,7 +25,9 @@ from homeassistant.const import (
     CONF_EVENT,
     CONF_EVENT_DATA,
     CONF_EVENT_DATA_TEMPLATE,
+    CONF_REPEAT,
     CONF_SCENE,
+    CONF_SEQUENCE,
     CONF_TIMEOUT,
     CONF_WAIT_TEMPLATE,
     SERVICE_TURN_OFF,
@@ -313,6 +316,10 @@ class _ScriptRunBase(ABC):
         if not check:
             raise _StopScript
 
+    @abstractmethod
+    async def _async_repeat_step(self):
+        """Repeat a sequence."""
+
     def _log(self, msg, *args, level=logging.INFO):
         self._script._log(msg, *args, level=level)  # pylint: disable=protected-access
 
@@ -408,6 +415,41 @@ class _ScriptRun(_ScriptRunBase):
                 task.cancel()
             unsub()
 
+    async def _async_run_long_action(self, long_task):
+        """Run a long task while monitoring for stop request."""
+
+        async def async_cancel_long_task():
+            # Stop long task and wait for it to finish.
+            long_task.cancel()
+            try:
+                await long_task
+            except Exception:  # pylint: disable=broad-except
+                pass
+
+        # Wait for long task while monitoring for a stop request.
+        stop_task = self._hass.async_create_task(self._stop.wait())
+        try:
+            await asyncio.wait(
+                {long_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+        # If our task is cancelled, then cancel long task, too. Note that if long task
+        # is cancelled otherwise the CancelledError exception will not be raised to
+        # here due to the call to asyncio.wait(). Rather we'll check for that below.
+        except asyncio.CancelledError:
+            await async_cancel_long_task()
+            raise
+        finally:
+            stop_task.cancel()
+
+        if long_task.cancelled():
+            raise asyncio.CancelledError
+        if long_task.done():
+            # Propagate any exceptions that occurred.
+            long_task.result()
+        else:
+            # Stopped before long task completed, so cancel it.
+            await async_cancel_long_task()
+
     async def _async_call_service_step(self):
         """Call the service specified in the action."""
         domain, service, service_data = self._prep_call_service_step()
@@ -441,37 +483,36 @@ class _ScriptRun(_ScriptRunBase):
             await service_task
             return
 
-        async def async_cancel_service_task():
-            # Stop service task and wait for it to finish.
-            service_task.cancel()
+        await self._async_run_long_action(service_task)
+
+    async def _async_repeat_step(self):
+        """Repeat a sequence."""
+        count = self._action[CONF_REPEAT]
+        if isinstance(count, template.Template):
             try:
-                await service_task
-            except Exception:  # pylint: disable=broad-except
-                pass
+                count = vol.Coerce(int)(count.async_render(self._variables))
+            except (exceptions.TemplateError, vol.Invalid) as ex:
+                self._log(
+                    "Error rendering %s repeat template: %s",
+                    self._script.name,
+                    ex,
+                    level=logging.ERROR,
+                )
+                raise _StopScript
 
-        # No call limit so watch for a stop request.
-        stop_task = self._hass.async_create_task(self._stop.wait())
-        try:
-            await asyncio.wait(
-                {service_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
+        for iteration in range(1, count + 1):
+            self._log(
+                "Repeating %s: Iteration %i of %i",
+                self._action.get(CONF_ALIAS, "sequence"),
+                iteration,
+                count,
             )
-        # If our task is cancelled, then cancel service task, too. Note that if service
-        # task is cancelled otherwise the CancelledError exception will not be raised to
-        # here due to the call to asyncio.wait(). Rather we'll check for that below.
-        except asyncio.CancelledError:
-            await async_cancel_service_task()
-            raise
-        finally:
-            stop_task.cancel()
-
-        if service_task.cancelled():
-            raise asyncio.CancelledError
-        if service_task.done():
-            # Propagate any exceptions that occurred.
-            service_task.result()
-        elif running_script:
-            # Stopped before service completed, so cancel service.
-            await async_cancel_service_task()
+            task = self._hass.async_create_task(
+                self._script._repeat_script[self._step].async_run(
+                    self._variables, self._context
+                )
+            )
+            await self._async_run_long_action(task)
 
 
 class _QueuedScriptRun(_ScriptRun):
@@ -656,6 +697,11 @@ class _LegacyScriptRun(_ScriptRunBase):
             *self._prep_call_service_step(), blocking=True, context=self._context
         )
 
+    async def _async_repeat_step(self):
+        """Repeat a sequence."""
+        # Not supported in legacy mode.
+        pass
+
     def _async_remove_listener(self):
         """Remove listeners, if any."""
         for unsub in self._async_listener:
@@ -700,6 +746,22 @@ class Script:
             for action in self.sequence
         )
 
+        self._repeat_script = {}
+        for step, action in enumerate(sequence):
+            if cv.determine_script_action(action) == cv.SCRIPT_ACTION_REPEAT:
+                step_name = action.get(CONF_ALIAS, f"Repeat at step {step}")
+                sub_script = Script(
+                    hass,
+                    action[CONF_SEQUENCE],
+                    f"{name}: {step_name}",
+                    script_mode=SCRIPT_MODE_PARALLEL,
+                    logger=self._logger,
+                )
+                sub_script.change_listener = partial(
+                    self._chain_change_listener, sub_script
+                )
+                self._repeat_script[step] = sub_script
+
         self._runs: List[_ScriptRunBase] = []
         if script_mode == SCRIPT_MODE_QUEUE:
             self._queue_max = queue_max
@@ -712,6 +774,11 @@ class Script:
     def _changed(self):
         if self.change_listener:
             self._hass.async_run_job(self.change_listener)
+
+    def _chain_change_listener(self, sub_script):
+        if sub_script.is_running:
+            self.last_action = sub_script.last_action
+            self._changed()
 
     @property
     def is_running(self) -> bool:

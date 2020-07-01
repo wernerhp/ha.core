@@ -11,6 +11,8 @@ from homeassistant.const import (
     CONF_ALIAS,
     CONF_ICON,
     CONF_MODE,
+    CONF_REPEAT,
+    CONF_SEQUENCE,
     SERVICE_RELOAD,
     SERVICE_TOGGLE,
     SERVICE_TURN_OFF,
@@ -43,12 +45,15 @@ ATTR_VARIABLES = "variables"
 CONF_DESCRIPTION = "description"
 CONF_EXAMPLE = "example"
 CONF_FIELDS = "fields"
-CONF_SEQUENCE = "sequence"
 CONF_QUEUE_MAX = "queue_size"
 
 ENTITY_ID_FORMAT = DOMAIN + ".{}"
 
 EVENT_SCRIPT_STARTED = "script_started"
+
+_UNSUPPORTED_IN_LEGACY = [
+    cv.SCRIPT_ACTION_REPEAT,
+]
 
 
 def _deprecated_legacy_mode(config):
@@ -67,6 +72,19 @@ def _deprecated_legacy_mode(config):
             SCRIPT_MODE_LEGACY,
             ", ".join(legacy_scripts),
         )
+    return config
+
+
+def _not_supported_in_legacy_mode(config):
+    for object_id, cfg in config.items():
+        if cfg[CONF_MODE] != SCRIPT_MODE_LEGACY:
+            continue
+        for action in cfg[CONF_SEQUENCE]:
+            if cv.determine_script_action(action) in _UNSUPPORTED_IN_LEGACY:
+                raise vol.Invalid(
+                    f"{CONF_REPEAT} action not supported by {SCRIPT_MODE_LEGACY} "
+                    f"mode script {object_id}"
+                )
     return config
 
 
@@ -107,6 +125,7 @@ CONFIG_SCHEMA = vol.Schema(
         DOMAIN: vol.All(
             cv.schema_with_slug_keys(SCRIPT_ENTRY_SCHEMA),
             _deprecated_legacy_mode,
+            _not_supported_in_legacy_mode,
             _queue_max,
         )
     },
