@@ -51,9 +51,9 @@ ENTITY_ID_FORMAT = DOMAIN + ".{}"
 
 EVENT_SCRIPT_STARTED = "script_started"
 
-_UNSUPPORTED_IN_LEGACY = [
-    cv.SCRIPT_ACTION_REPEAT,
-]
+_UNSUPPORTED_IN_LEGACY = {
+    cv.SCRIPT_ACTION_REPEAT: CONF_REPEAT,
+}
 
 
 def _deprecated_legacy_mode(config):
@@ -80,10 +80,11 @@ def _not_supported_in_legacy_mode(config):
         if cfg[CONF_MODE] != SCRIPT_MODE_LEGACY:
             continue
         for action in cfg[CONF_SEQUENCE]:
-            if cv.determine_script_action(action) in _UNSUPPORTED_IN_LEGACY:
+            script_action = cv.determine_script_action(action)
+            if script_action in _UNSUPPORTED_IN_LEGACY:
                 raise vol.Invalid(
-                    f"{CONF_REPEAT} action not supported by {SCRIPT_MODE_LEGACY} "
-                    f"mode script {object_id}"
+                    f"{_UNSUPPORTED_IN_LEGACY[script_action]} action not supported by "
+                    f"{SCRIPT_MODE_LEGACY} mode script {object_id}"
                 )
     return config
 
