@@ -4,7 +4,7 @@ import asyncio
 from contextlib import suppress
 from datetime import datetime
 from functools import partial
-from itertools import islice
+import itertools
 import logging
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, cast
 
@@ -19,6 +19,7 @@ from homeassistant.const import (
     CONF_ALIAS,
     CONF_CONDITION,
     CONF_CONTINUE_ON_TIMEOUT,
+    CONF_COUNT,
     CONF_DELAY,
     CONF_DEVICE_ID,
     CONF_DOMAIN,
@@ -29,7 +30,9 @@ from homeassistant.const import (
     CONF_SCENE,
     CONF_SEQUENCE,
     CONF_TIMEOUT,
+    CONF_UNTIL,
     CONF_WAIT_TEMPLATE,
+    CONF_WHILE,
     SERVICE_TURN_OFF,
     SERVICE_TURN_ON,
 )
@@ -300,18 +303,21 @@ class _ScriptRunBase(ABC):
             self._action[CONF_EVENT], event_data, context=self._context
         )
 
+    async def _async_get_condition(self, config):
+        config_cache_key = frozenset((k, str(v)) for k, v in config.items())
+        cond = self._config_cache.get(config_cache_key)
+        if not cond:
+            cond = await condition.async_from_config(self._hass, config, False)
+            self._config_cache[config_cache_key] = cond
+        return cond
+
     async def _async_condition_step(self):
         """Test if condition is matching."""
-        config_cache_key = frozenset((k, str(v)) for k, v in self._action.items())
-        config = self._config_cache.get(config_cache_key)
-        if not config:
-            config = await condition.async_from_config(self._hass, self._action, False)
-            self._config_cache[config_cache_key] = config
-
         self._script.last_action = self._action.get(
             CONF_ALIAS, self._action[CONF_CONDITION]
         )
-        check = config(self._hass, self._variables)
+        cond = await self._async_get_condition(self._action)
+        check = cond(self._hass, self._variables)
         self._log("Test condition %s: %s", self._script.last_action, check)
         if not check:
             raise _StopScript
@@ -487,32 +493,65 @@ class _ScriptRun(_ScriptRunBase):
 
     async def _async_repeat_step(self):
         """Repeat a sequence."""
-        count = self._action[CONF_REPEAT]
-        if isinstance(count, template.Template):
-            try:
-                count = vol.Coerce(int)(count.async_render(self._variables))
-            except (exceptions.TemplateError, vol.Invalid) as ex:
-                self._log(
-                    "Error rendering %s repeat template: %s",
-                    self._script.name,
-                    ex,
-                    level=logging.ERROR,
-                )
-                raise _StopScript
 
-        for iteration in range(1, count + 1):
-            self._log(
-                "Repeating %s: Iteration %i of %i",
-                self._action.get(CONF_ALIAS, "sequence"),
-                iteration,
-                count,
-            )
+        description = self._action.get(CONF_ALIAS, "sequence")
+        repeat = self._action[CONF_REPEAT]
+
+        async def async_run_sequence(iteration, extra_msg="", extra_vars={}):
+            self._log("Repeating %s: Iteration %i%s", description, iteration, extra_msg)
+            repeat_vars = {"repeat": {"first": iteration == 1, "index": iteration}}
+            repeat_vars["repeat"].update(extra_vars)
             task = self._hass.async_create_task(
                 self._script._repeat_script[self._step].async_run(
-                    self._variables, self._context
+                    # Add repeat to variables. Override if it already exists in case of
+                    # nested calls.
+                    {**(self._variables or {}), **repeat_vars},
+                    self._context,
                 )
             )
             await self._async_run_long_action(task)
+
+        if CONF_COUNT in repeat:
+            count = repeat[CONF_COUNT]
+            if isinstance(count, template.Template):
+                try:
+                    count = vol.Coerce(int)(count.async_render(self._variables))
+                except (exceptions.TemplateError, vol.Invalid) as ex:
+                    self._log(
+                        "Error rendering %s repeat count template: %s",
+                        self._script.name,
+                        ex,
+                        level=logging.ERROR,
+                    )
+                    raise _StopScript
+            for iteration in range(1, count + 1):
+                await async_run_sequence(
+                    iteration, f" of {count}", {"last": iteration == count}
+                )
+                if self._stop.is_set():
+                    break
+
+        elif CONF_WHILE in repeat:
+            conditions = [
+                await self._async_get_condition(config) for config in repeat[CONF_WHILE]
+            ]
+            for iteration in itertools.count(1):
+                if self._stop.is_set() or not all(
+                    cond(self._hass, self._variables) for cond in conditions
+                ):
+                    break
+                await async_run_sequence(iteration)
+
+        elif CONF_UNTIL in repeat:
+            conditions = [
+                await self._async_get_condition(config) for config in repeat[CONF_UNTIL]
+            ]
+            for iteration in itertools.count(1):
+                await async_run_sequence(iteration)
+                if self._stop.is_set() or all(
+                    cond(self._hass, self._variables) for cond in conditions
+                ):
+                    break
 
 
 class _QueuedScriptRun(_ScriptRun):
@@ -607,7 +646,7 @@ class _LegacyScriptRun(_ScriptRunBase):
 
         suspended = False
         try:
-            for self._step, self._action in islice(
+            for self._step, self._action in itertools.islice(
                 enumerate(self._script.sequence), self._cur, None
             ):
                 await self._async_step(log_exceptions=not propagate_exceptions)
@@ -752,7 +791,7 @@ class Script:
                 step_name = action.get(CONF_ALIAS, f"Repeat at step {step}")
                 sub_script = Script(
                     hass,
-                    action[CONF_SEQUENCE],
+                    action[CONF_REPEAT][CONF_SEQUENCE],
                     f"{name}: {step_name}",
                     script_mode=SCRIPT_MODE_PARALLEL,
                     logger=self._logger,
