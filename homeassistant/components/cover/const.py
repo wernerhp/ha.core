@@ -17,6 +17,7 @@ class CoverEntityStateAttribute(StrEnum):
     IS_CLOSED = "is_closed"
     CURRENT_POSITION = "current_position"
     CURRENT_TILT_POSITION = "current_tilt_position"
+    REPORTS_STATE = "reports_state"
 
 
 INTENT_OPEN_COVER = "HassOpenCover"

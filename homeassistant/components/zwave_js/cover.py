@@ -89,6 +89,15 @@ class CoverPositionMixin(ZWaveBaseEntity, CoverEntity):
     # Remember whether the moving state can be tracked reliably for this device.
     _moving_state_disabled: bool = False
 
+    @property
+    def reports_state(self) -> bool:
+        """Return True when this device reliably reports transient motion.
+
+        Multilevel Switch CC v3 and older suppress moving state, so those
+        devices must not vouch for motion reporting.
+        """
+        return not self._moving_state_disabled
+
     def _set_position_values(
         self,
         current_value: ZwaveValue,
@@ -573,6 +582,7 @@ class ZwaveMotorizedBarrier(ZWaveBaseEntity, CoverEntity):
 
     _attr_supported_features = CoverEntityFeature.OPEN | CoverEntityFeature.CLOSE
     _attr_device_class = CoverDeviceClass.GARAGE
+    _attr_reports_state = True
 
     def __init__(
         self,

@@ -207,10 +207,23 @@ class CoverEntity(Entity, cached_properties=CACHED_PROPERTIES_WITH_ATTR_):
     _attr_is_closed: bool | None
     _attr_is_closing: bool | None = None
     _attr_is_opening: bool | None = None
+    _attr_reports_state: bool = False
     _attr_state: None = None
     _attr_supported_features: CoverEntityFeature | None
 
     _cover_is_last_toggle_direction_open = True
+
+    @property
+    def reports_state(self) -> bool:
+        """Return True if the entity reliably reports transient motion.
+
+        When True, is_opening / is_closing are guaranteed to be implemented
+        and to return a non-None value while the cover moves, so consumers
+        may treat a resting state as genuinely idle. When False (default), a
+        resting state carries no motion information and consumers must not
+        infer idleness from it.
+        """
+        return self._attr_reports_state
 
     @cached_property
     def current_cover_position(self) -> int | None:
@@ -263,6 +276,7 @@ class CoverEntity(Entity, cached_properties=CACHED_PROPERTIES_WITH_ATTR_):
         data: dict[str, Any] = {}
 
         data[CoverEntityStateAttribute.IS_CLOSED] = self.is_closed
+        data[CoverEntityStateAttribute.REPORTS_STATE] = self.reports_state
 
         if (current := self.current_cover_position) is not None:
             data[CoverEntityStateAttribute.CURRENT_POSITION] = current
